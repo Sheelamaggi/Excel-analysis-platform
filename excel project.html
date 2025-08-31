@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en" class="">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Excel Analytics Platform</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = { darkMode: 'class' }
+    </script>
+    <!-- React & Babel -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Redux Toolkit -->
+    <script src="https://unpkg.com/@reduxjs/toolkit@1.9.5/dist/redux-toolkit.umd.js"></script>
+    <script src="https://unpkg.com/react-redux@8.1.2/dist/react-redux.js"></script>
+    <!-- SheetJS (for Excel parsing) -->
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+    <!-- Three.js (for 3D charts) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- PDF Generation -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .loading-spinner { border: 4px solid rgba(0, 0, 0, 0.1); width: 36px; height: 36px; border-radius: 50%; border-left-color: #4f46e5; animation: spin 1s ease infinite; }
+        .loading-spinner-small { border: 2px solid rgba(0, 0, 0, 0.1); width: 20px; height: 20px; border-radius: 50%; border-left-color: #4f46e5; animation: spin 1s ease infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .file-upload-area { transition: background-color 0.3s ease; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .animate-fade-in { animation: fadeIn 0.5s ease-out forwards; }
+        #three-d-container canvas { display: block; width: 100%; height: 100%; }
+    </style>
+</head>
+<body class="bg-slate-50 dark:bg-gray-900 transition-colors duration-300">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { createSlice, configureStore, createAsyncThunk } = RTK;
+        const { Provider, useSelector, useDispatch } = ReactRedux;
+        const { useState, useEffect, useRef, forwardRef, useImperativeHandle } = React;
+        const { jsPDF } = window.jspdf;
+
+        // ===== 1. API SERVICE =====
+        const api = {
+            login: (email, password) => new Promise((resolve, reject) => {
+                setTimeout(() => email === "user@example.com" && password === "password123" ? resolve({ success: true, user: { name: "Saikiran", email: "user@example.com" }, token: "fake-jwt-token-for-session" }) : reject(new Error("Invalid credentials.")), 1000);
+            }),
+            signup: (name, email, password) => new Promise((resolve) => {
+                setTimeout(() => resolve({ success: true, user: { name, email }, token: "new-fake-jwt-token" }), 1000);
+            }),
+            // --- AI Summary API Call (NEW) ---
+            getAiSummary: async (prompt) => {
+                const apiKey = ""; // Canvas will provide this
+                const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+                
+                const payload = {
+                    contents: [{ role: "user", parts: [{ text: prompt }] }]
+                };
+
+                const response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to get AI summary.');
+                }
+
+                const result = await response.json();
+                if (result.candidates && result.candidates.length > 0 && result.candidates[0].content.parts.length > 0) {
+                    return result.candidates[0].content.parts[0].text;
+                }
+                throw new Error('No content in AI response.');
+            }
+        };
+
+        // ===== 2. REDUX SLICES =====
+        const loginUser = createAsyncThunk('auth/loginUser', async ({ email, password }, { rejectWithValue }) => {
+            try { return await api.login(email, password); } catch (error) { return rejectWithValue(error.message); }
+        });
+
+        // --- AI Summary Thunk (NEW) ---
+        const fetchAiSummary = createAsyncThunk('data/fetchAiSummary', async ({ xAxis, yAxis, data }, { rejectWithValue }) => {
+            const simplifiedData = data.slice(0, 20).map(row => ({ [xAxis]: row[xAxis], [yAxis]: row[yAxis] }));
+            const prompt = `You are a data analyst. Provide a brief, insightful summary in three bullet points for the following data. The x-axis represents "${xAxis}" and the y-axis represents "${yAxis}". Data: ${JSON.stringify(simplifiedData)}`;
+            try {
+                return await api.getAiSummary(prompt);
+            } catch (error) {
+                return rejectWithValue(error.message);
+            }
+        });
+
+        const authSlice = createSlice({
+            name: 'auth',
+            initialState: { isAuthenticated: false, user: null, token: null, status: 'idle', error: null },
+            reducers: { logout: (state) => { state.isAuthenticated = false; state.user = null; state.token = null; state.status = 'idle'; state.error = null; } },
+            extraReducers: (builder) => { builder.addCase(loginUser.pending, (state) => { state.status = 'loading'; state.error = null; }).addCase(loginUser.fulfilled, (state, action) => { state.status = 'succeeded'; state.isAuthenticated = true; state.user = action.payload.user; state.token = action.payload.token; }).addCase(loginUser.rejected, (state, action) => { state.status = 'failed'; state.error = action.payload; }); }
+        });
+        const { logout } = authSlice.actions;
+        
+        const dataSlice = createSlice({
+            name: 'data',
+            initialState: { fileInfo: null, headers: [], rows: [], status: 'idle', error: null, history: [], aiSummary: null, aiSummaryStatus: 'idle', aiSummaryError: null },
+            reducers: {
+                setParsing: (state) => { state.status = 'parsing'; state.error = null; },
+                setData: (state, action) => {
+                    state.fileInfo = action.payload.fileInfo; state.headers = action.payload.headers; state.rows = action.payload.rows; state.status = 'succeeded';
+                    const newHistoryItem = { id: Date.now(), ...action.payload.fileInfo, analyzedAt: new Date().toISOString() };
+                    state.history.unshift(newHistoryItem);
+                    if (state.history.length > 5) state.history.pop();
+                    state.aiSummary = null; state.aiSummaryStatus = 'idle'; state.aiSummaryError = null; // Reset AI summary on new data
+                },
+                setError: (state, action) => { state.status = 'failed'; state.error = action.payload; },
+                clearData: (state) => { state.fileInfo = null; state.headers = []; state.rows = []; state.status = 'idle'; state.error = null; state.aiSummary = null; state.aiSummaryStatus = 'idle'; state.aiSummaryError = null; }
+            },
+            extraReducers: (builder) => {
+                builder
+                    .addCase(fetchAiSummary.pending, (state) => { state.aiSummaryStatus = 'loading'; state.aiSummaryError = null; })
+                    .addCase(fetchAiSummary.fulfilled, (state, action) => { state.aiSummaryStatus = 'succeeded'; state.aiSummary = action.payload; })
+                    .addCase(fetchAiSummary.rejected, (state, action) => { state.aiSummaryStatus = 'failed'; state.aiSummaryError = action.payload; });
+            }
+        });
+        const { setParsing, setData, setError, clearData } = dataSlice.actions;
+
+        const themeSlice = createSlice({
+            name: 'theme',
+            initialState: { mode: 'light' },
+            reducers: { toggleTheme: (state) => { state.mode = state.mode === 'light' ? 'dark' : 'light'; } }
+        });
+        const { toggleTheme } = themeSlice.actions;
+
+        // ===== 3. REDUX STORE CONFIGURATION =====
+        const store = configureStore({ reducer: { auth: authSlice.reducer, data: dataSlice.reducer, theme: themeSlice.reducer } });
+
+        // ===== 4. UI COMPONENTS =====
+        function LoadingSpinner({ size = 'normal' }) { return <div className={size === 'small' ? 'loading-spinner-small' : 'loading-spinner'}></div>; }
+        
+        function FileUpload({ history }) {
+            const dispatch = useDispatch();
+            const { status, error } = useSelector(state => state.data);
+            const [isDragging, setIsDragging] = useState(false);
+            const fileInputRef = useRef(null);
+
+            const handleFile = (file) => {
+                if (!file) {
+                    return;
+                }
+                if (!file.name.endsWith('.xlsx') && !file.name.endsWith('.xls')) {
+                    dispatch(setError("Invalid file type. Please upload an .xlsx or .xls file."));
+                    return;
+                }
+                dispatch(setParsing());
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    try {
+                        const data = e.target.result;
+                        const workbook = XLSX.read(data, { type: 'binary' });
+                        const sheetName = workbook.SheetNames[0];
+                        const worksheet = workbook.Sheets[sheetName];
+                        const json_data = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+                        if (json_data.length < 2) {
+                            throw new Error("Excel file is empty or has no data rows.");
+                        }
+                        const headers = json_data[0];
+                        const rows = XLSX.utils.sheet_to_json(worksheet, { raw: false });
+                        dispatch(setData({ fileInfo: { name: file.name, size: file.size }, headers, rows }));
+                    } catch (err) {
+                        dispatch(setError(err.message || "Error parsing file."));
+                    }
+                };
+                reader.onerror = () => {
+                    dispatch(setError("Failed to read file."));
+                };
+                reader.readAsBinaryString(file);
+            };
+
+            const handleDragEvents = (e, dragging) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setIsDragging(dragging);
+            };
+
+            const handleDrop = (e) => {
+                handleDragEvents(e, false);
+                if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+                    handleFile(e.dataTransfer.files[0]);
+                }
+            };
+            
+            return (
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 animate-fade-in">
+                    <div className="bg-white dark:bg-gray-800 p-6 md:p-8 rounded-xl shadow-lg w-full">
+                        <h2 className="text-xl font-semibold text-gray-700 dark:text-gray-200">Start a New Analysis</h2>
+                        <p className="text-gray-500 dark:text-gray-400 mb-6">Drop an Excel file here or click to upload.</p>
+                        {status === 'failed' && (<div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-lg relative mb-6" role="alert"><span className="block sm:inline">{error}</span></div>)}
+                        <div 
+                            className={`file-upload-area border-2 border-dashed rounded-lg p-12 text-center cursor-pointer ${isDragging ? 'border-indigo-600 bg-indigo-50 dark:bg-gray-700' : 'border-gray-300 dark:border-gray-600 hover:border-indigo-500'}`} 
+                            onDragOver={e => handleDragEvents(e, true)} 
+                            onDragLeave={e => handleDragEvents(e, false)} 
+                            onDrop={handleDrop} 
+                            onClick={() => fileInputRef.current.click()}
+                        >
+                            <input ref={fileInputRef} type="file" className="hidden" accept=".xlsx, .xls" onChange={(e) => handleFile(e.target.files[0])} />
+                            {status === 'parsing' ? (
+                                <div className="flex flex-col items-center justify-center">
+                                    <LoadingSpinner />
+                                    <p className="mt-4 text-gray-600 dark:text-gray-300">Parsing...</p>
+                                </div>
+                            ) : (
+                                <div className="flex flex-col items-center justify-center">
+                                    <svg className="w-12 h-12 text-gray-400 dark:text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 16a4 4 0 01-4-4V6a2 2 0 012-2h10a2 2 0 012 2v6a4 4 0 01-4 4H7z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M16 16v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2m10-4l-3-3m0 0l-3 3m3-3v12"></path></svg>
+                                    <p className="mt-2 text-gray-600 dark:text-gray-400">Drag & Drop or <span className="font-semibold text-indigo-600 dark:text-indigo-400">Browse</span></p>
+                                    <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">Supports: .xlsx, .xls</p>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                    <div className="bg-white dark:bg-gray-800 p-6 md:p-8 rounded-xl shadow-lg w-full">
+                         <h2 className="text-xl font-semibold text-gray-700 dark:text-gray-200 mb-4">Upload History</h2>
+                         {history.length > 0 ? (
+                            <ul className="space-y-3">
+                                {history.map(item => (
+                                    <li key={item.id} className="p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg flex justify-between items-center">
+                                        <div>
+                                            <p className="font-medium text-gray-800 dark:text-gray-200">{item.name}</p>
+                                            <p className="text-sm text-gray-500 dark:text-gray-400">Analyzed on {new Date(item.analyzedAt).toLocaleDateString()}</p>
+                                        </div>
+                                        <span className="text-xs font-mono text-gray-400 dark:text-gray-500">{(item.size / 1024).toFixed(2)} KB</span>
+                                    </li>
+                                ))}
+                            </ul>
+                         ) : (
+                            <div className="text-center py-12 text-gray-500 dark:text-gray-400">
+                                <svg className="w-16 h-16 mx-auto text-gray-300 dark:text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V7a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+                                <p className="mt-4">Your past analyses will appear here.</p>
+                            </div>
+                         )}
+                    </div>
+                </div>
+            );
+        }
+
+        const DataChart = forwardRef(({ chartData, type, theme }, ref) => { 
+            const chartRef = useRef(null); 
+            const chartInstance = useRef(null); 
+            useImperativeHandle(ref, () => ({ getCanvas: () => chartRef.current })); 
+            useEffect(() => { 
+                if (chartRef.current && chartData) { 
+                    const ctx = chartRef.current.getContext('2d'); 
+                    if (chartInstance.current) chartInstance.current.destroy(); 
+                    const isDark = theme === 'dark'; 
+                    const textColor = isDark ? '#e5e7eb' : '#374151'; 
+                    const gridColor = isDark ? 'rgba(255, 255, 255, 0.1)' : '#e5e7eb'; 
+                    const options = { 
+                        responsive: true, 
+                        maintainAspectRatio: false, 
+                        plugins: { 
+                            legend: { display: true, position: 'top', labels: { color: textColor } }, 
+                            tooltip: { backgroundColor: '#111827', titleColor: '#fff', bodyColor: '#fff', padding: 12, cornerRadius: 8 } 
+                        } 
+                    }; 
+                    if (type !== 'pie' && type !== 'doughnut') { 
+                        options.scales = { 
+                            y: { beginAtZero: true, grid: { color: gridColor }, ticks: { color: textColor } }, 
+                            x: { type: 'category', grid: { color: gridColor }, ticks: { color: textColor } } 
+                        }; 
+                    } 
+                    chartInstance.current = new Chart(ctx, { type, data: chartData, options }); 
+                } 
+                return () => { if (chartInstance.current) chartInstance.current.destroy(); }; 
+            }, [chartData, type, theme]); 
+            
+            return <div className="relative h-full w-full"><canvas ref={chartRef}></canvas></div>; 
+        });
+
+        const ThreeDChart = forwardRef(({ chartData, theme }, ref) => { 
+            const mountRef = useRef(null); 
+            const rendererRef = useRef(null); 
+            useImperativeHandle(ref, () => ({ getCanvas: () => rendererRef.current?.domElement })); 
+            useEffect(() => { 
+                const { OrbitControls } = THREE; 
+                const currentMount = mountRef.current; 
+                const isDark = theme === 'dark'; 
+                const scene = new THREE.Scene(); 
+                scene.background = new THREE.Color(isDark ? 0x111827 : 0xffffff); 
+                const camera = new THREE.PerspectiveCamera(75, currentMount.clientWidth / currentMount.clientHeight, 0.1, 1000); 
+                camera.position.set(20, 20, 30); 
+                const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true }); 
+                renderer.setSize(currentMount.clientWidth, currentMount.clientHeight); 
+                renderer.setPixelRatio(window.devicePixelRatio); 
+                currentMount.appendChild(renderer.domElement); 
+                rendererRef.current = renderer; 
+                const controls = new OrbitControls(camera, renderer.domElement); 
+                controls.enableDamping = true; 
+                const ambientLight = new THREE.AmbientLight(0xffffff, 0.7); 
+                scene.add(ambientLight); 
+                const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8); 
+                directionalLight.position.set(10, 20, 5); 
+                scene.add(directionalLight); 
+                const gridHelper = new THREE.GridHelper(100, 20, isDark ? 0x444444 : 0xcccccc, isDark ? 0x444444 : 0xcccccc); 
+                gridHelper.position.y = -0.5; 
+                scene.add(gridHelper); 
+                const group = new THREE.Group(); 
+                const numericData = chartData.datasets[0].data.map(v => parseFloat(v)).filter(v => !isNaN(v)); 
+                const maxVal = Math.max(...numericData, 1); 
+                const barWidth = 2, barDepth = 2; 
+                numericData.forEach((value, index) => { 
+                    const height = (value / maxVal) * 20; 
+                    const geometry = new THREE.BoxGeometry(barWidth, height, barDepth); 
+                    const material = new THREE.MeshStandardMaterial({ color: chartData.datasets[0].backgroundColor[index] || '#4f46e5' }); 
+                    const bar = new THREE.Mesh(geometry, material); 
+                    bar.position.set(index * (barWidth + 1.5) - (numericData.length * (barWidth + 1.5) / 2), height / 2, 0); 
+                    group.add(bar); 
+                }); 
+                scene.add(group); 
+                const animate = () => { if (!rendererRef.current) return; requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); }; 
+                animate(); 
+                const handleResize = () => { camera.aspect = currentMount.clientWidth / currentMount.clientHeight; camera.updateProjectionMatrix(); renderer.setSize(currentMount.clientWidth, currentMount.clientHeight); }; 
+                window.addEventListener('resize', handleResize); 
+                return () => { 
+                    window.removeEventListener('resize', handleResize); 
+                    if(currentMount && renderer.domElement) currentMount.removeChild(renderer.domElement); 
+                    scene.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) { if (Array.isArray(o.material)) o.material.forEach(m => m.dispose()); else o.material.dispose(); } }); 
+                    rendererRef.current = null; 
+                }; 
+            }, [chartData, theme]); 
+            
+            return <div id="three-d-container" ref={mountRef} className="h-full w-full cursor-grab active:cursor-grabbing"></div>; 
+        });
+
+        function AnalysisView() {
+            const dispatch = useDispatch();
+            const { fileInfo, headers, rows, aiSummary, aiSummaryStatus, aiSummaryError } = useSelector(state => state.data);
+            const { mode: theme } = useSelector(state => state.theme);
+            const [xAxis, setXAxis] = useState('');
+            const [yAxis, setYAxis] = useState('');
+            const [chartType, setChartType] = useState('bar');
+            const [chartData, setChartData] = useState(null);
+            const chartComponentRef = useRef(null);
+
+            useEffect(() => { 
+                if (headers.length > 0) { 
+                    setXAxis(headers[0]); 
+                    const firstNumericHeader = headers.find(h => rows.some(r => typeof r[h] === 'number')); 
+                    setYAxis(firstNumericHeader || (headers.length > 1 ? headers[1] : '')); 
+                } 
+            }, [headers, rows]);
+            
+            useEffect(() => { 
+                if (xAxis && yAxis && rows.length > 0) { 
+                    const labels = rows.map(row => row[xAxis]); 
+                    const data = rows.map(row => parseFloat(row[yAxis])); 
+                    const backgroundColors = data.map(() => `hsl(${Math.random() * 360}, 75%, 60%)`); 
+                    setChartData({ 
+                        labels, 
+                        datasets: [{ 
+                            label: `${yAxis} by ${xAxis}`, 
+                            data: chartType === 'scatter' ? rows.map(row => ({ x: row[xAxis], y: row[yAxis] })) : data, 
+                            backgroundColor: chartType === 'pie' ? backgroundColors : (chartType === '3d-column' ? backgroundColors : 'rgba(79, 70, 229, 0.6)'), 
+                            borderColor: chartType === 'pie' ? (theme === 'dark' ? '#1f2937' : '#fff') : 'rgba(79, 70, 229, 1)', 
+                            borderWidth: chartType === 'line' ? 2 : (chartType === 'pie' ? 2 : 1), 
+                            pointRadius: chartType === 'scatter' ? 5 : 3, 
+                            fill: chartType === 'line', 
+                        }] 
+                    }); 
+                } 
+            }, [xAxis, yAxis, rows, chartType, theme]);
+
+            const handleDownload = (format) => { 
+                const canvas = chartComponentRef.current?.getCanvas(); 
+                if (!canvas) return; 
+                const dataUrl = canvas.toDataURL('image/png'); 
+                const link = document.createElement('a'); 
+                const fileName = `${fileInfo.name.split('.')[0]}-${chartType}-chart`; 
+                if (format === 'png') { 
+                    link.download = `${fileName}.png`; 
+                    link.href = dataUrl; 
+                    link.click(); 
+                } else if (format === 'pdf') { 
+                    const pdf = new jsPDF({ orientation: 'landscape' }); 
+                    const imgProps= pdf.getImageProperties(dataUrl); 
+                    const pdfWidth = pdf.internal.pageSize.getWidth(); 
+                    const pdfHeight = (imgProps.height * pdfWidth) / imgProps.width; 
+                    pdf.addImage(dataUrl, 'PNG', 0, 0, pdfWidth, pdfHeight); 
+                    pdf.save(`${fileName}.pdf`); 
+                } 
+            };
+            const handleGetAiSummary = () => { 
+                dispatch(fetchAiSummary({ xAxis, yAxis, data: rows })); 
+            };
+
+            return (
+                <div className="bg-white dark:bg-gray-800 p-6 md:p-8 rounded-xl shadow-lg w-full animate-fade-in">
+                    <div className="flex flex-col md:flex-row justify-between md:items-center gap-4 mb-6">
+                        <div>
+                            <h2 className="text-xl font-semibold text-gray-700 dark:text-gray-200">Analysis for: <span className="text-indigo-600 dark:text-indigo-400">{fileInfo.name}</span></h2>
+                            <p className="text-gray-500 dark:text-gray-400 text-sm">Select columns and chart type to visualize.</p>
+                        </div>
+                        <button onClick={() => dispatch(clearData())} className="bg-gray-200 hover:bg-gray-300 dark:bg-gray-700 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200 font-bold py-2 px-4 rounded-lg transition-colors text-sm self-start md:self-center">Upload New</button>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8 border-t border-gray-200 dark:border-gray-700 pt-6">
+                        <div>
+                            <label htmlFor="chart-type" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Chart Type</label>
+                            <select id="chart-type" value={chartType} onChange={e => setChartType(e.target.value)} className="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-200 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md">
+                                {['bar', 'line', 'pie', 'scatter', '3d-column'].map(type => <option key={type} value={type}>{type.replace('-', ' ').replace(/\b\w/g, l => l.toUpperCase())}</option>)}
+                            </select>
+                        </div>
+                        <div>
+                            <label htmlFor="x-axis" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">{chartType === 'pie' ? 'Label Column' : 'X-Axis'}</label>
+                            <select id="x-axis" value={xAxis} onChange={e => setXAxis(e.target.value)} className="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-200 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md">
+                                {headers.map(h => <option key={h} value={h}>{h}</option>)}
+                            </select>
+                        </div>
+                        <div>
+                            <label htmlFor="y-axis" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">{chartType === 'pie' ? 'Value Column' : 'Y-Axis'}</label>
+                            <select id="y-axis" value={yAxis} onChange={e => setYAxis(e.target.value)} className="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-200 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md">
+                                {headers.map(h => <option key={h} value={h}>{h}</option>)}
+                            </select>
+                        </div>
+                    </div>
+                    <div className="h-[32rem] mb-6 bg-gray-50 dark:bg-gray-900/50 rounded-lg p-2 md:p-4">
+                        {chartData ? (chartType === '3d-column' ? <ThreeDChart ref={chartComponentRef} chartData={chartData} theme={theme} /> : <DataChart ref={chartComponentRef} chartData={chartData} type={chartType} theme={theme} />) : <div className="flex items-center justify-center h-full text-gray-500 dark:text-gray-400">Select axes to generate a chart.</div>}
+                    </div>
+                    
+                    <div className="border-t border-gray-200 dark:border-gray-700 pt-6">
+                        <div className="flex justify-between items-center mb-4">
+                            <h3 className="text-lg font-semibold text-gray-700 dark:text-gray-200">AI Data Insights</h3>
+                            <button onClick={handleGetAiSummary} disabled={aiSummaryStatus === 'loading'} className="bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded-lg transition-colors flex items-center gap-2 disabled:bg-purple-400">
+                                {aiSummaryStatus === 'loading' ? <LoadingSpinner size="small" /> : <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>}
+                                {aiSummaryStatus === 'loading' ? 'Analyzing...' : 'Get AI Summary'}
+                            </button>
+                        </div>
+                        {aiSummaryStatus === 'succeeded' && <div className="p-4 bg-gray-50 dark:bg-gray-900/50 rounded-lg text-gray-700 dark:text-gray-300 prose prose-sm max-w-none" dangerouslySetInnerHTML={{ __html: aiSummary.replace(/\*/g, '<strong>').replace(/\n/g, '<br />') }}></div>}
+                        {aiSummaryStatus === 'failed' && <div className="p-4 bg-red-50 dark:bg-red-900/20 rounded-lg text-red-600 dark:text-red-400">{aiSummaryError}</div>}
+                    </div>
+
+                    <div className="flex justify-end items-center gap-4 border-t border-gray-200 dark:border-gray-700 pt-6 mt-6">
+                        <button onClick={() => handleDownload('png')} className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded-lg transition-colors flex items-center gap-2"><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>Download PNG</button>
+                        <button onClick={() => handleDownload('pdf')} className="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg transition-colors flex items-center gap-2"><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>Download PDF</button>
+                    </div>
+                </div>
+            );
+        }
+
+        function ThemeToggler() { 
+            const dispatch = useDispatch(); 
+            const { mode } = useSelector(state => state.theme); 
+            return (
+                <button onClick={() => dispatch(toggleTheme())} className="p-2 rounded-full text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 dark:focus:ring-white">
+                    {mode === 'light' ? 
+                        <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg> :
+                        <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
+                    }
+                </button>
+            );
+        }
+        
+        function DashboardPage() { 
+            const dispatch = useDispatch(); 
+            const user = useSelector((state) => state.auth.user); 
+            const { status: dataStatus, history } = useSelector(state => state.data); 
+            const handleLogout = () => { 
+                dispatch(logout()); 
+                dispatch(clearData()); 
+            }; 
+            return (
+                <div className="w-full min-h-screen flex flex-col">
+                    <header className="bg-white dark:bg-gray-800 shadow-sm sticky top-0 z-10 transition-colors duration-300">
+                        <nav className="container mx-auto px-6 py-3 flex justify-between items-center">
+                            <div className="text-2xl font-bold text-indigo-600 dark:text-indigo-400">Analytics<span className="text-gray-700 dark:text-gray-300">Platform</span></div>
+                            <div className="flex items-center gap-4">
+                                <span className="text-gray-600 dark:text-gray-300">Welcome, {user?.name}!</span>
+                                <ThemeToggler />
+                                <button onClick={handleLogout} className="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-lg transition-colors">Logout</button>
+                            </div>
+                        </nav>
+                    </header>
+                    <main className="flex-grow container mx-auto px-6 py-8">
+                        {dataStatus === 'succeeded' ? <AnalysisView /> : <FileUpload history={history} />}
+                    </main>
+                </div>
+            ); 
+        }
+
+        function App() { 
+            const { isAuthenticated } = useSelector((state) => state.auth); 
+            const { mode: theme } = useSelector((state) => state.theme); 
+            const [currentPage, setCurrentPage] = useState('login'); 
+            
+            useEffect(() => { 
+                if (theme === 'dark') {
+                    document.documentElement.classList.add('dark');
+                } else {
+                    document.documentElement.classList.remove('dark');
+                }
+            }, [theme]); 
+            
+            if (isAuthenticated) return <DashboardPage />; 
+            
+            return (
+                <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50 dark:bg-gray-900 p-4 transition-colors duration-300">
+                    <div className="text-center mb-8">
+                        <h1 className="text-4xl font-bold text-indigo-600 dark:text-indigo-400">Excel Analytics Platform</h1>
+                        <p className="text-gray-600 dark:text-gray-400 mt-2">Upload, Analyze, and Visualize your data with ease.</p>
+                    </div>
+                    {currentPage === 'login' ? <LoginPage onSwitchToSignup={() => setCurrentPage('signup')} /> : <SignupPage onSwitchToLogin={() => setCurrentPage('login')} />}
+                </div>
+            ); 
+        }
+
+        function LoginPage({ onSwitchToSignup }) { 
+            const [email, setEmail] = useState('user@example.com'); 
+            const [password, setPassword] = useState('password123'); 
+            const dispatch = useDispatch(); 
+            const { status, error } = useSelector((state) => state.auth); 
+            const handleSubmit = (e) => { 
+                e.preventDefault(); 
+                if (status !== 'loading') { 
+                    dispatch(loginUser({ email, password })); 
+                } 
+            }; 
+            return (
+                <div className="bg-white dark:bg-gray-800 p-8 md:p-12 rounded-2xl shadow-xl w-full max-w-md">
+                    <h2 className="text-3xl font-bold text-gray-800 dark:text-gray-200 mb-2">Welcome Back!</h2>
+                    <p className="text-gray-500 dark:text-gray-400 mb-8">Login to access your dashboard.</p>
+                    {status === 'failed' && (<div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-lg relative mb-6" role="alert"><span className="block sm:inline">{error}</span></div>)}
+                    <form onSubmit={handleSubmit}>
+                        <div className="mb-6">
+                            <label className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-2" htmlFor="email">Email Address</label>
+                            <input className="shadow-sm appearance-none border border-gray-300 dark:border-gray-600 rounded-lg w-full py-3 px-4 text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500" id="email" type="email" placeholder="you@example.com" value={email} onChange={(e) => setEmail(e.target.value)} required />
+                        </div>
+                        <div className="mb-6">
+                            <label className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-2" htmlFor="password">Password</label>
+                            <input className="shadow-sm appearance-none border border-gray-300 dark:border-gray-600 rounded-lg w-full py-3 px-4 text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-700 mb-3 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500" id="password" type="password" placeholder="******************" value={password} onChange={(e) => setPassword(e.target.value)} required />
+                        </div>
+                        <div className="flex items-center justify-between">
+                            <button className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-6 rounded-lg focus:outline-none focus:shadow-outline w-full flex items-center justify-center transition-all duration-300 disabled:bg-indigo-400" type="submit" disabled={status === 'loading'}>
+                                {status === 'loading' ? <LoadingSpinner /> : 'Sign In'}
+                            </button>
+                        </div>
+                    </form>
+                    <p className="text-center text-gray-500 dark:text-gray-400 text-sm mt-8">Don't have an account?{' '}
+                        <a href="#" onClick={onSwitchToSignup} className="font-bold text-indigo-600 dark:text-indigo-400 hover:underline">Sign Up</a>
+                    </p>
+                </div>
+            ); 
+        }
+        function SignupPage({ onSwitchToLogin }) { 
+            return (
+                <div className="bg-white dark:bg-gray-800 p-8 md:p-12 rounded-2xl shadow-xl w-full max-w-md">
+                    <h2 className="text-3xl font-bold text-gray-800 dark:text-gray-200 mb-2">Create Account</h2>
+                    <p className="text-gray-500 dark:text-gray-400 mb-8">Get started with your free account today.</p>
+                    <form>
+                        <div className="mb-6">
+                            <label className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-2" htmlFor="name">Full Name</label>
+                            <input className="shadow-sm appearance-none border border-gray-300 dark:border-gray-600 rounded-lg w-full py-3 px-4 text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500" id="name" type="text" placeholder="John Doe" required />
+                        </div>
+                        <div className="mb-6">
+                            <label className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-2" htmlFor="signup-email">Email Address</label>
+                            <input className="shadow-sm appearance-none border border-gray-300 dark:border-gray-600 rounded-lg w-full py-3 px-4 text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500" id="signup-email" type="email" placeholder="you@example.com" required />
+                        </div>
+                        <div className="mb-6">
+                            <label className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-2" htmlFor="signup-password">Password</label>
+                            <input className="shadow-sm appearance-none border border-gray-300 dark:border-gray-600 rounded-lg w-full py-3 px-4 text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-700 mb-3 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500" id="signup-password" type="password" placeholder="******************" required />
+                        </div>
+                        <div className="flex items-center justify-between">
+                            <button className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-6 rounded-lg focus:outline-none focus:shadow-outline w-full flex items-center justify-center transition-all duration-300" type="submit">Sign Up</button>
+                        </div>
+                    </form>
+                    <p className="text-center text-gray-500 dark:text-gray-400 text-sm mt-8">Already have an account?{' '}
+                        <a href="#" onClick={onSwitchToLogin} className="font-bold text-indigo-600 dark:text-indigo-400 hover:underline">Login</a>
+                    </p>
+                </div>
+            );
+        }
+
+        // --- CORRECTED THREE.JS ORBIT CONTROLS HELPER ---
+        THREE.OrbitControls = function (object, domElement) { this.object = object; this.domElement = (domElement !== undefined) ? domElement : document; this.enabled = true; this.target = new THREE.Vector3(); this.minDistance = 0; this.maxDistance = Infinity; this.minZoom = 0; this.maxZoom = Infinity; this.minPolarAngle = 0; this.maxPolarAngle = Math.PI; this.minAzimuthAngle = -Infinity; this.maxAzimuthAngle = Infinity; this.enableDamping = false; this.dampingFactor = 0.25; this.enableZoom = true; this.zoomSpeed = 1.0; this.enableRotate = true; this.rotateSpeed = 1.0; this.enablePan = true; this.keyPanSpeed = 7.0; this.autoRotate = false; this.autoRotateSpeed = 2.0; this.enableKeys = true; this.keys = { LEFT: 37, UP: 38, RIGHT: 39, BOTTOM: 40 }; this.mouseButtons = { ORBIT: THREE.MOUSE.LEFT, ZOOM: THREE.MOUSE.MIDDLE, PAN: THREE.MOUSE.RIGHT }; this.target0 = this.target.clone(); this.position0 = this.object.position.clone(); this.zoom0 = this.object.zoom; this.getPolarAngle = function () { return spherical.phi; }; this.getAzimuthalAngle = function () { return spherical.theta; }; this.saveState = function () { scope.target0.copy(scope.target); scope.position0.copy(scope.object.position); scope.zoom0 = scope.object.zoom; }; this.reset = function () { scope.target.copy(scope.target0); scope.object.position.copy(scope.position0); scope.object.zoom = scope.zoom0; scope.object.updateProjectionMatrix(); scope.dispatchEvent(changeEvent); scope.update(); state = STATE.NONE; }; this.update = (function () { var offset = new THREE.Vector3(); var quat = new THREE.Quaternion().setFromUnitVectors(object.up, new THREE.Vector3(0, 1, 0)); var quatInverse = quat.clone().invert(); var lastPosition = new THREE.Vector3(); var lastQuaternion = new THREE.Quaternion(); return function update() { var position = scope.object.position; offset.copy(position).sub(scope.target); offset.applyQuaternion(quat); spherical.setFromVector3(offset); if (scope.autoRotate && state === STATE.NONE) { rotateLeft(getAutoRotationAngle()); } spherical.theta += sphericalDelta.theta; spherical.phi += sphericalDelta.phi; spherical.theta = Math.max(scope.minAzimuthAngle, Math.min(scope.maxAzimuthAngle, spherical.theta)); spherical.phi = Math.max(scope.minPolarAngle, Math.min(scope.maxPolarAngle, spherical.phi)); spherical.makeSafe(); spherical.radius *= scale; spherical.radius = Math.max(scope.minDistance, Math.min(scope.maxDistance, spherical.radius)); scope.target.add(panOffset); offset.setFromSpherical(spherical); offset.applyQuaternion(quatInverse); position.copy(scope.target).add(offset); scope.object.lookAt(scope.target); if (scope.enableDamping === true) { sphericalDelta.theta *= (1 - scope.dampingFactor); sphericalDelta.phi *= (1 - scope.dampingFactor); } else { sphericalDelta.set(0, 0, 0); } panOffset.set(0, 0, 0); scale = 1; if (zoomChanged || lastPosition.distanceToSquared(scope.object.position) > EPS || 8 * (1 - lastQuaternion.dot(scope.object.quaternion)) > EPS) { scope.dispatchEvent(changeEvent); lastPosition.copy(scope.object.position); lastQuaternion.copy(scope.object.quaternion); zoomChanged = false; return true; } return false; }; }()); this.dispose = function () { scope.domElement.removeEventListener('contextmenu', onContextMenu, false); scope.domElement.removeEventListener('mousedown', onMouseDown, false); scope.domElement.removeEventListener('wheel', onMouseWheel, false); scope.domElement.removeEventListener('touchstart', onTouchStart, false); scope.domElement.removeEventListener('touchend', onTouchEnd, false); scope.domElement.removeEventListener('touchmove', onTouchMove, false); document.removeEventListener('mousemove', onMouseMove, false); document.removeEventListener('mouseup', onMouseUp, false); window.removeEventListener('keydown', onKeyDown, false); }; var scope = this; var changeEvent = { type: 'change' }; var startEvent = { type: 'start' }; var endEvent = { type: 'end' }; var STATE = { NONE: - 1, ROTATE: 0, DOLLY: 1, PAN: 2, TOUCH_ROTATE: 3, TOUCH_DOLLY_PAN: 4 }; var state = STATE.NONE; var EPS = 0.000001; var spherical = new THREE.Spherical(); var sphericalDelta = new THREE.Spherical(); var scale = 1; var panOffset = new THREE.Vector3(); var zoomChanged = false; var rotateStart = new THREE.Vector2(); var rotateEnd = new THREE.Vector2(); var rotateDelta = new THREE.Vector2(); var panStart = new THREE.Vector2(); var panEnd = new THREE.Vector2(); var panDelta = new THREE.Vector2(); var dollyStart = new THREE.Vector2(); var dollyEnd = new THREE.Vector2(); var dollyDelta = new THREE.Vector2(); function getAutoRotationAngle() { return 2 * Math.PI / 60 / 60 * scope.autoRotateSpeed; } function getZoomScale() { return Math.pow(0.95, scope.zoomSpeed); } function rotateLeft(angle) { sphericalDelta.theta -= angle; } function rotateUp(angle) { sphericalDelta.phi -= angle; } var panLeft = function () { var v = new THREE.Vector3(); return function panLeft(distance, objectMatrix) { v.setFromMatrixColumn(objectMatrix, 0); v.multiplyScalar(- distance); panOffset.add(v); }; }(); var panUp = function () { var v = new THREE.Vector3(); return function panUp(distance, objectMatrix) { v.setFromMatrixColumn(objectMatrix, 1); v.multiplyScalar(distance); panOffset.add(v); }; }(); var pan = function () { var offset = new THREE.Vector3(); return function pan(deltaX, deltaY) { var element = scope.domElement === document ? scope.domElement.body : scope.domElement; if (scope.object.isPerspectiveCamera) { var position = scope.object.position; offset.copy(position).sub(scope.target); var targetDistance = offset.length(); targetDistance *= Math.tan((scope.object.fov / 2) * Math.PI / 180.0); panLeft(2 * deltaX * targetDistance / element.clientHeight, scope.object.matrix); panUp(2 * deltaY * targetDistance / element.clientHeight, scope.object.matrix); } else if (scope.object.isOrthographicCamera) { panLeft(deltaX * (scope.object.right - scope.object.left) / scope.object.zoom / element.clientWidth, scope.object.matrix); panUp(deltaY * (scope.object.top - scope.object.bottom) / scope.object.zoom / element.clientHeight, scope.object.matrix); } else { console.warn('WARNING: OrbitControls.js encountered an unknown camera type - pan disabled.'); scope.enablePan = false; } }; }(); function dollyIn(dollyScale) { if (scope.object.isPerspectiveCamera) { scale /= dollyScale; } else if (scope.object.isOrthographicCamera) { scope.object.zoom = Math.max(scope.minZoom, Math.min(scope.maxZoom, scope.object.zoom * dollyScale)); scope.object.updateProjectionMatrix(); zoomChanged = true; } else { console.warn('WARNING: OrbitControls.js encountered an unknown camera type - dolly/zoom disabled.'); scope.enableZoom = false; } } function dollyOut(dollyScale) { if (scope.object.isPerspectiveCamera) { scale *= dollyScale; } else if (scope.object.isOrthographicCamera) { scope.object.zoom = Math.max(scope.minZoom, Math.min(scope.maxZoom, scope.object.zoom / dollyScale)); scope.object.updateProjectionMatrix(); zoomChanged = true; } else { console.warn('WARNING: OrbitControls.js encountered an unknown camera type - dolly/zoom disabled.'); scope.enableZoom = false; } } function onMouseDown(event) { if (scope.enabled === false) return; event.preventDefault(); if (event.button === scope.mouseButtons.ORBIT) { if (scope.enableRotate === false) return; state = STATE.ROTATE; rotateStart.set(event.clientX, event.clientY); } else if (event.button === scope.mouseButtons.ZOOM) { if (scope.enableZoom === false) return; state = STATE.DOLLY; dollyStart.set(event.clientX, event.clientY); } else if (event.button === scope.mouseButtons.PAN) { if (scope.enablePan === false) return; state = STATE.PAN; panStart.set(event.clientX, event.clientY); } if (state !== STATE.NONE) { document.addEventListener('mousemove', onMouseMove, false); document.addEventListener('mouseup', onMouseUp, false); scope.dispatchEvent(startEvent); } } function onMouseMove(event) { if (scope.enabled === false) return; event.preventDefault(); if (state === STATE.ROTATE) { if (scope.enableRotate === false) return; rotateEnd.set(event.clientX, event.clientY); rotateDelta.subVectors(rotateEnd, rotateStart); var element = scope.domElement === document ? scope.domElement.body : scope.domElement; rotateLeft(2 * Math.PI * rotateDelta.x / element.clientWidth * scope.rotateSpeed); rotateUp(2 * Math.PI * rotateDelta.y / element.clientHeight * scope.rotateSpeed); rotateStart.copy(rotateEnd); scope.update(); } else if (state === STATE.DOLLY) { if (scope.enableZoom === false) return; dollyEnd.set(event.clientX, event.clientY); dollyDelta.subVectors(dollyEnd, dollyStart); if (dollyDelta.y > 0) { dollyIn(getZoomScale()); } else if (dollyDelta.y < 0) { dollyOut(getZoomScale()); } dollyStart.copy(dollyEnd); scope.update(); } else if (state === STATE.PAN) { if (scope.enablePan === false) return; panEnd.set(event.clientX, event.clientY); panDelta.subVectors(panEnd, panStart); pan(panDelta.x, panDelta.y); panStart.copy(panEnd); scope.update(); } } function onMouseUp(event) { if (scope.enabled === false) return; document.removeEventListener('mousemove', onMouseMove, false); document.removeEventListener('mouseup', onMouseUp, false); scope.dispatchEvent(endEvent); state = STATE.NONE; } function onMouseWheel(event) { if (scope.enabled === false || scope.enableZoom === false || (state !== STATE.NONE && state !== STATE.ROTATE)) return; event.preventDefault(); event.stopPropagation(); if (event.deltaY < 0) { dollyOut(getZoomScale()); } else if (event.deltaY > 0) { dollyIn(getZoomScale()); } scope.update(); scope.dispatchEvent(startEvent); scope.dispatchEvent(endEvent); } function onKeyDown(event) { if (scope.enabled === false || scope.enableKeys === false || scope.enablePan === false) return; switch (event.keyCode) { case scope.keys.UP: pan(0, scope.keyPanSpeed); scope.update(); break; case scope.keys.BOTTOM: pan(0, - scope.keyPanSpeed); scope.update(); break; case scope.keys.LEFT: pan(scope.keyPanSpeed, 0); scope.update(); break; case scope.keys.RIGHT: pan(- scope.keyPanSpeed, 0); scope.update(); break; } } function onTouchStart(event) { if (scope.enabled === false) return; switch (event.touches.length) { case 1: if (scope.enableRotate === false) return; state = STATE.TOUCH_ROTATE; rotateStart.set(event.touches[0].pageX, event.touches[0].pageY); break; case 2: if (scope.enableZoom === false && scope.enablePan === false) return; state = STATE.TOUCH_DOLLY_PAN; var dx = event.touches[0].pageX - event.touches[1].pageX; var dy = event.touches[0].pageY - event.touches[1].pageY; var distance = Math.sqrt(dx * dx + dy * dy); dollyStart.set(0, distance); panStart.set((event.touches[0].pageX + event.touches[1].pageX) / 2, (event.touches[0].pageY + event.touches[1].pageY) / 2); break; default: state = STATE.NONE; } if (state !== STATE.NONE) { scope.dispatchEvent(startEvent); } } function onTouchMove(event) { if (scope.enabled === false) return; event.preventDefault(); event.stopPropagation(); switch (event.touches.length) { case 1: if (scope.enableRotate === false) return; if (state !== STATE.TOUCH_ROTATE) return; rotateEnd.set(event.touches[0].pageX, event.touches[0].pageY); rotateDelta.subVectors(rotateEnd, rotateStart); var element = scope.domElement === document ? scope.domElement.body : scope.domElement; rotateLeft(2 * Math.PI * rotateDelta.x / element.clientWidth * scope.rotateSpeed); rotateUp(2 * Math.PI * rotateDelta.y / element.clientHeight * scope.rotateSpeed); rotateStart.copy(rotateEnd); scope.update(); break; case 2: if (scope.enableZoom === false && scope.enablePan === false) return; if (state !== STATE.TOUCH_DOLLY_PAN) return; var dx = event.touches[0].pageX - event.touches[1].pageX; var dy = event.touches[0].pageY - event.touches[1].pageY; var distance = Math.sqrt(dx * dx + dy * dy); dollyEnd.set(0, distance); dollyDelta.subVectors(dollyEnd, dollyStart); if (dollyDelta.y > 0) { dollyOut(getZoomScale()); } else if (dollyDelta.y < 0) { dollyIn(getZoomScale()); } dollyStart.copy(dollyEnd); panEnd.set((event.touches[0].pageX + event.touches[1].pageX) / 2, (event.touches[0].pageY + event.touches[1].pageY) / 2); panDelta.subVectors(panEnd, panStart); pan(panDelta.x, panDelta.y); panStart.copy(panEnd); scope.update(); break; default: state = STATE.NONE; } } function onTouchEnd(event) { if (scope.enabled === false) return; scope.dispatchEvent(endEvent); state = STATE.NONE; } function onContextMenu(event) { if (scope.enabled === false) return; event.preventDefault(); } scope.domElement.addEventListener('contextmenu', onContextMenu, false); scope.domElement.addEventListener('mousedown', onMouseDown, false); scope.domElement.addEventListener('wheel', onMouseWheel, false); scope.domElement.addEventListener('touchstart', onTouchStart, false); scope.domElement.addEventListener('touchend', onTouchEnd, false); scope.domElement.addEventListener('touchmove', onTouchMove, false); window.addEventListener('keydown', onKeyDown, false); this.update(); }; THREE.OrbitControls.prototype = Object.create(THREE.EventDispatcher.prototype); THREE.OrbitControls.prototype.constructor = THREE.OrbitControls;
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<Provider store={store}><App /></Provider>);
+    </script>
+</body>
+</html>
